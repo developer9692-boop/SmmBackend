@@ -9,8 +9,8 @@
 //  • Admin: forward an order to the provider, check status, request refill
 //  • Legacy orders API             /api/orders
 //
-// Admin routes are protected by the ADMIN_KEY environment variable
-// (sent by the admin panel in the "x-admin-key" header).
+// Admin routes are protected by the admin's Firebase login (Bearer token)
+// checked against ADMIN_EMAILS in .env. ADMIN_KEY is an optional fallback.
 // Requires Node 18+ (built-in fetch).
 // ============================================================
 
@@ -137,19 +137,62 @@ class HttpError extends Error {
 }
 
 // ── Admin auth ───────────────────────────────────────────────
+// Admins are verified with their Firebase login token (no key typed in the panel).
+//   FIREBASE_API_KEY=<same apiKey as in firebase-config.js>
+//   ADMIN_EMAILS=you@gmail.com,other@gmail.com
+// ADMIN_KEY (x-admin-key header) still works as an optional fallback for scripts.
+const FIREBASE_API_KEY = String(process.env.FIREBASE_API_KEY || "").trim();
+const ADMIN_EMAILS = String(process.env.ADMIN_EMAILS || "")
+  .split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+const FIREBASE_READY = !!FIREBASE_API_KEY && ADMIN_EMAILS.length > 0;
+
 function sha(s) { return crypto.createHash("sha256").update(String(s)).digest(); }
 
-function requireAdmin(req, res, next) {
-  if (!ADMIN_KEY) {
-    return res.status(503).json({
-      error: "ADMIN_KEY is not set on the server. Start the server with ADMIN_KEY=your-secret npm start"
-    });
+const tokenCache = new Map();   // idToken -> { email, exp }
+async function verifyFirebaseAdmin(token) {
+  const hit = tokenCache.get(token);
+  if (hit && hit.exp > Date.now()) return hit.email;
+
+  let r;
+  try {
+    r = await fetch(
+      "https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=" + encodeURIComponent(FIREBASE_API_KEY),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken: token }) }
+    );
+  } catch { throw new HttpError(502, "Could not reach Firebase to verify the admin login"); }
+  if (!r.ok) return null;
+  const d = await r.json();
+  const u = d.users && d.users[0];
+  if (!u || !u.email || u.disabled || !u.emailVerified) return null;
+  const email = String(u.email).toLowerCase();
+  if (!ADMIN_EMAILS.includes(email)) return null;
+
+  if (tokenCache.size > 200) tokenCache.clear();
+  tokenCache.set(token, { email, exp: Date.now() + 5 * 60 * 1000 });
+  return email;
+}
+
+async function requireAdmin(req, res, next) {
+  try {
+    if (!FIREBASE_READY && !ADMIN_KEY) {
+      return res.status(503).json({
+        error: "Admin auth is not configured. Set FIREBASE_API_KEY and ADMIN_EMAILS in the server .env file."
+      });
+    }
+
+    const bearer = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    if (bearer && FIREBASE_READY) {
+      const email = await verifyFirebaseAdmin(bearer);
+      if (email) { req.adminEmail = email; return next(); }
+    }
+
+    const given = req.get("x-admin-key") || "";
+    if (ADMIN_KEY && given && crypto.timingSafeEqual(sha(given), sha(ADMIN_KEY))) return next();
+
+    return res.status(401).json({ error: "Not authorized as admin" });
+  } catch (err) {
+    next(err);
   }
-  const given = req.get("x-admin-key") || "";
-  if (!crypto.timingSafeEqual(sha(given), sha(ADMIN_KEY))) {
-    return res.status(401).json({ error: "Invalid admin key" });
-  }
-  next();
 }
 
 // ── Provider helpers ────────────────────────────────────────
@@ -555,7 +598,7 @@ app.delete("/api/orders/:id", requireAdmin, (req, res) => {
 
 // ── Health check ─────────────────────────────────────────────
 app.get("/api", (req, res) => {
-  res.json({ ok: true, name: "AstroPulse API", adminKeyConfigured: !!ADMIN_KEY });
+  res.json({ ok: true, name: "AstroPulse API", adminAuthConfigured: FIREBASE_READY || !!ADMIN_KEY });
 });
 
 // ── Error handler ────────────────────────────────────────────
@@ -570,9 +613,8 @@ app.use((err, req, res, next) => {          // eslint-disable-line no-unused-var
 // ── Start ────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`✅  AstroPulse server running at http://localhost:${PORT}`);
-  if (!ADMIN_KEY) {
-    console.warn("⚠️   ADMIN_KEY is not set — admin API routes are disabled.");
-    console.warn("    Start with:  ADMIN_KEY=your-long-secret npm start");
+  if (!FIREBASE_READY && !ADMIN_KEY) {
+    console.warn("⚠️   Admin API disabled. Set FIREBASE_API_KEY and ADMIN_EMAILS in .env");
   }
   const ep = envProvider();
   if (!ep) {
