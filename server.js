@@ -4,7 +4,7 @@
 //
 // Features
 //  • Public service catalog        GET  /api/services
-//  • Admin: SMM API providers      /api/admin/providers   (add / edit / delete / test)
+//  • Admin: SMM API providers      /api/admin/providers   (read-only, configured in .env; test only)
 //  • Admin: services linked to a provider service ID   /api/admin/services
 //  • Admin: forward an order to the provider, check status, request refill
 //  • Legacy orders API             /api/orders
@@ -19,6 +19,23 @@ const cors    = require("cors");
 const fs      = require("fs");
 const path    = require("path");
 const crypto  = require("crypto");
+
+// Load .env from the project folder (no extra dependency needed)
+(function loadEnv() {
+  try {
+    const file = path.join(__dirname, ".env");
+    if (!fs.existsSync(file)) return;
+    for (const raw of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (!m) continue;
+      let v = m[2].trim();
+      if (/^(".*"|'.*')$/.test(v)) v = v.slice(1, -1);
+      if (process.env[m[1]] === undefined) process.env[m[1]] = v;
+    }
+  } catch { /* ignore */ }
+})();
 
 const app       = express();
 const PORT      = process.env.PORT || 3000;
@@ -66,10 +83,31 @@ function writeJson(file, data) {
   fs.renameSync(tmp, file);
 }
 
-const readProviders  = () => readJson(FILES.providers);
-const writeProviders = (d) => writeJson(FILES.providers, d);
-const readServices   = () => readJson(FILES.services);
-const writeServices  = (d) => writeJson(FILES.services, d);
+// The SMM API is configured ONLY in the server .env file:
+//   SMM_API_URL=https://provider.example.com/api/v2
+//   SMM_API_KEY=your-provider-key
+//   SMM_API_NAME=Provider name (optional)
+// It cannot be added, edited or deleted from the admin panel.
+const ENV_PROVIDER_ID = "env_provider";
+function envProvider() {
+  const url = String(process.env.SMM_API_URL || "").trim();
+  const key = String(process.env.SMM_API_KEY || "").trim();
+  if (!url || !key) return null;
+  return {
+    id: ENV_PROVIDER_ID,
+    name: String(process.env.SMM_API_NAME || "SMM Provider").trim() || "SMM Provider",
+    url, key,
+    active: true,
+    createdAt: null
+  };
+}
+const readProviders = () => { const p = envProvider(); return p ? [p] : []; };
+// Every service is fulfilled by the single .env provider
+const readServices  = () => {
+  const list = readJson(FILES.services);
+  return envProvider() ? list.map(s => ({ ...s, providerId: ENV_PROVIDER_ID })) : list;
+};
+const writeServices = (d) => writeJson(FILES.services, d);
 const readSent       = () => readJson(FILES.sent);
 const writeSent      = (d) => writeJson(FILES.sent, d);
 
@@ -127,6 +165,8 @@ function publicProvider(p, services) {
     url: p.url,
     keyHint: maskKey(p.key),
     active: p.active !== false,
+    locked: true,
+    source: "env",
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
     serviceCount: services.filter(s => s.providerId === p.id).length
@@ -141,9 +181,9 @@ function cleanUrl(value) {
   return parsed.toString();
 }
 
-function findProvider(id) {
-  const provider = readProviders().find(p => p.id === id);
-  if (!provider) throw new HttpError(404, "API provider not found");
+function findProvider() {
+  const provider = envProvider();
+  if (!provider) throw new HttpError(503, "SMM API is not configured. Set SMM_API_URL and SMM_API_KEY in the server .env file and restart.");
   return provider;
 }
 
@@ -276,66 +316,14 @@ admin.get("/providers", (req, res) => {
   res.json(readProviders().map(p => publicProvider(p, services)));
 });
 
-admin.post("/providers", (req, res) => {
-  const name = String(req.body.name || "").trim();
-  const key  = String(req.body.key || "").trim();
-  if (!name) throw new HttpError(400, "Provider name is required");
-  if (!key)  throw new HttpError(400, "API key is required");
-  const url = cleanUrl(req.body.url);
-
-  const providers = readProviders();
-  const provider = {
-    id: "p_" + crypto.randomBytes(4).toString("hex"),
-    name, url, key,
-    active: true,
-    createdAt: new Date().toISOString()
-  };
-  providers.push(provider);
-  writeProviders(providers);
-  res.status(201).json({ success: true, provider: publicProvider(provider, readServices()) });
-});
-
-admin.put("/providers/:id", (req, res) => {
-  const providers = readProviders();
-  const idx = providers.findIndex(p => p.id === req.params.id);
-  if (idx === -1) throw new HttpError(404, "API provider not found");
-  const p = providers[idx];
-
-  if (req.body.name !== undefined) {
-    const name = String(req.body.name).trim();
-    if (!name) throw new HttpError(400, "Provider name is required");
-    p.name = name;
-  }
-  if (req.body.url !== undefined) p.url = cleanUrl(req.body.url);
-  const newKey = String(req.body.key || "").trim();
-  if (newKey) p.key = newKey;                     // blank key = keep the existing one
-  if (req.body.active !== undefined) p.active = !!req.body.active;
-  p.updatedAt = new Date().toISOString();
-
-  writeProviders(providers);
-  svcCache.delete(p.id);
-  res.json({ success: true, provider: publicProvider(p, readServices()) });
-});
-
-admin.delete("/providers/:id", (req, res) => {
-  const providers = readProviders();
-  const provider = providers.find(p => p.id === req.params.id);
-  if (!provider) throw new HttpError(404, "API provider not found");
-
-  const services = readServices();
-  const linked = services.filter(s => s.providerId === provider.id);
-  if (linked.length && req.query.force !== "true") {
-    return res.status(409).json({
-      error: `${linked.length} service(s) use this API. Deleting it will also delete those services.`,
-      serviceCount: linked.length
-    });
-  }
-
-  writeProviders(providers.filter(p => p.id !== provider.id));
-  if (linked.length) writeServices(services.filter(s => s.providerId !== provider.id));
-  svcCache.delete(provider.id);
-  res.json({ success: true, deletedServices: linked.length });
-});
+// Providers are configured in .env only: add / edit / delete are blocked.
+const lockedProvider = (req, res) => {
+  throw new HttpError(403, "The SMM API is configured in the server .env file (SMM_API_URL / SMM_API_KEY). It cannot be changed from the panel.");
+};
+admin.post("/providers", lockedProvider);
+admin.put("/providers/:id", lockedProvider);
+admin.patch("/providers/:id", lockedProvider);
+admin.delete("/providers/:id", lockedProvider);
 
 // Test an API (fetch balance)
 admin.post("/providers/:id/test", wrap(async (req, res) => {
@@ -585,6 +573,13 @@ app.listen(PORT, () => {
   if (!ADMIN_KEY) {
     console.warn("⚠️   ADMIN_KEY is not set — admin API routes are disabled.");
     console.warn("    Start with:  ADMIN_KEY=your-long-secret npm start");
+  }
+  const ep = envProvider();
+  if (!ep) {
+    console.warn("⚠️   SMM API not configured. Add SMM_API_URL and SMM_API_KEY to .env");
+  } else {
+    try { new URL(ep.url); console.log(`🔗  SMM API: ${ep.name} (${ep.url})`); }
+    catch { console.warn("⚠️   SMM_API_URL in .env is not a valid URL"); }
   }
   if (typeof fetch !== "function") {
     console.warn("⚠️   This Node version has no built-in fetch. Use Node 18 or newer.");
