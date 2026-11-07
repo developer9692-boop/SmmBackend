@@ -6,6 +6,8 @@
 //  • Public service catalog        GET  /api/services
 //  • Admin: SMM API providers      /api/admin/providers   (read-only, configured in .env; test only)
 //  • Admin: services linked to a provider service ID   /api/admin/services
+//      - DELETE /api/admin/services        -> remove ALL services at once
+//      - DELETE /api/admin/services/:id    -> remove one service
 //  • Admin: forward an order to the provider, check status, request refill
 //  • Legacy orders API             /api/orders
 //
@@ -427,6 +429,16 @@ admin.put("/services/:id", (req, res) => {
   res.json({ success: true, service: updated });
 });
 
+// DELETE /api/admin/services — remove ALL services at once.
+// Platforms (Instagram, Facebook, ...) are not stored on the server, so they are not affected.
+admin.delete("/services", (req, res) => {
+  const count = readServices().length;
+  writeServices([]);
+  console.log(`[SERVICES] All services removed (${count}) by ${req.adminEmail || "admin key"}`);
+  res.json({ success: true, removed: count });
+});
+
+// DELETE /api/admin/services/:id — remove one service
 admin.delete("/services/:id", (req, res) => {
   const services = readServices();
   const next = services.filter(s => String(s.id) !== String(req.params.id));
@@ -597,8 +609,14 @@ app.delete("/api/orders/:id", requireAdmin, (req, res) => {
 });
 
 // ── Health check ─────────────────────────────────────────────
+// Open /api in a browser to confirm THIS version of server.js is the one running.
 app.get("/api", (req, res) => {
-  res.json({ ok: true, name: "AstroPulse API", adminAuthConfigured: FIREBASE_READY || !!ADMIN_KEY });
+  res.json({
+    ok: true,
+    name: "AstroPulse API",
+    version: "bulk-delete-services",
+    adminAuthConfigured: FIREBASE_READY || !!ADMIN_KEY
+  });
 });
 
 // ── Error handler ────────────────────────────────────────────
