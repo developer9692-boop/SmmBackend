@@ -4,7 +4,8 @@
 //
 // Features
 //  • Public service catalog        GET  /api/services
-//  • Admin: SMM API providers      /api/admin/providers   (read-only, configured in .env; test only)
+//  • Admin: SMM API providers      /api/admin/providers   (up to 5; add / edit / delete / test)
+//  • Admin: bulk-add services      POST /api/admin/services/bulk
 //  • Admin: services linked to a provider service ID   /api/admin/services
 //      - DELETE /api/admin/services        -> remove ALL services at once
 //      - DELETE /api/admin/services/:id    -> remove one service
@@ -85,11 +86,13 @@ function writeJson(file, data) {
   fs.renameSync(tmp, file);
 }
 
-// The SMM API is configured ONLY in the server .env file:
-//   SMM_API_URL=https://provider.example.com/api/v2
-//   SMM_API_KEY=your-provider-key
-//   SMM_API_NAME=Provider name (optional)
-// It cannot be added, edited or deleted from the admin panel.
+// Providers (max 5 in total)
+//  • Optional "env" provider from .env (locked, cannot be edited in the panel):
+//      SMM_API_URL=https://provider.example.com/api/v2
+//      SMM_API_KEY=your-provider-key
+//      SMM_API_NAME=Provider name (optional)
+//  • Any others are added from the admin panel and stored in data/providers.json
+const MAX_PROVIDERS = 5;
 const ENV_PROVIDER_ID = "env_provider";
 function envProvider() {
   const url = String(process.env.SMM_API_URL || "").trim();
@@ -103,11 +106,13 @@ function envProvider() {
     createdAt: null
   };
 }
-const readProviders = () => { const p = envProvider(); return p ? [p] : []; };
-// Every service is fulfilled by the single .env provider
+const readStoredProviders  = () => readJson(FILES.providers);
+const writeStoredProviders = (d) => writeJson(FILES.providers, d);
+const readProviders = () => { const p = envProvider(); return [...(p ? [p] : []), ...readStoredProviders()]; };
+// Older services saved without a providerId belong to the .env provider
 const readServices  = () => {
   const list = readJson(FILES.services);
-  return envProvider() ? list.map(s => ({ ...s, providerId: ENV_PROVIDER_ID })) : list;
+  return envProvider() ? list.map(s => s.providerId ? s : { ...s, providerId: ENV_PROVIDER_ID }) : list;
 };
 const writeServices = (d) => writeJson(FILES.services, d);
 const readSent       = () => readJson(FILES.sent);
@@ -210,8 +215,8 @@ function publicProvider(p, services) {
     url: p.url,
     keyHint: maskKey(p.key),
     active: p.active !== false,
-    locked: true,
-    source: "env",
+    locked: p.id === ENV_PROVIDER_ID,
+    source: p.id === ENV_PROVIDER_ID ? "env" : "panel",
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
     serviceCount: services.filter(s => s.providerId === p.id).length
@@ -226,9 +231,11 @@ function cleanUrl(value) {
   return parsed.toString();
 }
 
-function findProvider() {
-  const provider = envProvider();
-  if (!provider) throw new HttpError(503, "SMM API is not configured. Set SMM_API_URL and SMM_API_KEY in the server .env file and restart.");
+function findProvider(id) {
+  const list = readProviders();
+  if (!list.length) throw new HttpError(503, "No SMM API provider is configured. Add one in the admin panel.");
+  const provider = list.find(p => p.id === String(id || ""));
+  if (!provider) throw new HttpError(404, "API provider not found");
   return provider;
 }
 
@@ -361,14 +368,75 @@ admin.get("/providers", (req, res) => {
   res.json(readProviders().map(p => publicProvider(p, services)));
 });
 
-// Providers are configured in .env only: add / edit / delete are blocked.
-const lockedProvider = (req, res) => {
-  throw new HttpError(403, "The SMM API is configured in the server .env file (SMM_API_URL / SMM_API_KEY). It cannot be changed from the panel.");
+const lockedProvider = () => {
+  throw new HttpError(403, "This provider comes from the server .env file and cannot be changed from the panel.");
 };
-admin.post("/providers", lockedProvider);
-admin.put("/providers/:id", lockedProvider);
-admin.patch("/providers/:id", lockedProvider);
-admin.delete("/providers/:id", lockedProvider);
+
+// Add a provider (max 5 in total)
+admin.post("/providers", (req, res) => {
+  const all = readProviders();
+  if (all.length >= MAX_PROVIDERS) throw new HttpError(400, `You can add at most ${MAX_PROVIDERS} API providers.`);
+
+  const name = String(req.body.name || "").trim();
+  const key  = String(req.body.key || "").trim();
+  const url  = cleanUrl(req.body.url);
+  if (!name) throw new HttpError(400, "Provider name is required");
+  if (!key)  throw new HttpError(400, "API key is required");
+  if (all.some(p => p.name.toLowerCase() === name.toLowerCase())) throw new HttpError(409, "A provider with this name already exists");
+  if (all.some(p => p.url === url && p.key === key)) throw new HttpError(409, "This API URL and key were already added");
+
+  const provider = {
+    id: "prov_" + crypto.randomBytes(4).toString("hex"),
+    name, url, key, active: true,
+    createdAt: new Date().toISOString()
+  };
+  const stored = readStoredProviders();
+  stored.push(provider);
+  writeStoredProviders(stored);
+  res.status(201).json({ success: true, provider: publicProvider(provider, readServices()) });
+});
+
+// Edit a provider (leave key blank to keep the current one)
+admin.put("/providers/:id", (req, res) => {
+  if (req.params.id === ENV_PROVIDER_ID) return lockedProvider();
+  const stored = readStoredProviders();
+  const idx = stored.findIndex(p => p.id === req.params.id);
+  if (idx === -1) throw new HttpError(404, "API provider not found");
+
+  const cur = stored[idx];
+  const name = req.body.name === undefined ? cur.name : String(req.body.name).trim();
+  const url  = req.body.url  === undefined ? cur.url  : cleanUrl(req.body.url);
+  const key  = req.body.key ? String(req.body.key).trim() : cur.key;
+  if (!name) throw new HttpError(400, "Provider name is required");
+  if (readProviders().some(p => p.id !== cur.id && p.name.toLowerCase() === name.toLowerCase())) {
+    throw new HttpError(409, "A provider with this name already exists");
+  }
+  stored[idx] = {
+    ...cur, name, url, key,
+    active: req.body.active === undefined ? cur.active !== false : !!req.body.active,
+    updatedAt: new Date().toISOString()
+  };
+  writeStoredProviders(stored);
+  svcCache.delete(cur.id);
+  res.json({ success: true, provider: publicProvider(stored[idx], readServices()) });
+});
+
+// Delete a provider. If services use it, ?removeServices=true deletes those services too.
+admin.delete("/providers/:id", (req, res) => {
+  if (req.params.id === ENV_PROVIDER_ID) return lockedProvider();
+  const stored = readStoredProviders();
+  if (!stored.some(p => p.id === req.params.id)) throw new HttpError(404, "API provider not found");
+
+  const services = readServices();
+  const used = services.filter(s => s.providerId === req.params.id);
+  if (used.length && req.query.removeServices !== "true") {
+    throw new HttpError(409, `${used.length} service(s) use this provider. Remove them first or confirm deleting them too.`);
+  }
+  if (used.length) writeServices(services.filter(s => s.providerId !== req.params.id));
+  writeStoredProviders(stored.filter(p => p.id !== req.params.id));
+  svcCache.delete(req.params.id);
+  res.json({ success: true, removedServices: used.length });
+});
 
 // Test an API (fetch balance)
 admin.post("/providers/:id/test", wrap(async (req, res) => {
@@ -414,6 +482,37 @@ admin.post("/services", (req, res) => {
   services.push(svc);
   writeServices(services);
   res.status(201).json({ success: true, service: svc });
+});
+
+// POST /api/admin/services/bulk — add many provider services at once.
+// body: { items: [{ providerId, providerServiceId, platform, name, rate, min, max, ... }] }
+// Services already added (same provider + provider service ID) are skipped.
+admin.post("/services/bulk", (req, res) => {
+  const items = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+  if (!items.length) throw new HttpError(400, "No services selected");
+  if (items.length > 500) throw new HttpError(400, "Add at most 500 services at a time");
+
+  const services = readServices();
+  let nextId = services.reduce((m, s) => Math.max(m, Number(s.id) || 0), 1000) + 1;
+  const added = [], skipped = [], errors = [];
+
+  for (const item of items) {
+    const label = `${item && item.providerServiceId}`;
+    try {
+      const dupe = services.some(s => s.providerId === String(item.providerId) &&
+                                      String(s.providerServiceId) === String(item.providerServiceId));
+      if (dupe) { skipped.push(label); continue; }
+      const svc = normalizeService({ ...item, id: undefined }, null);
+      svc.id = nextId++;
+      svc.createdAt = new Date().toISOString();
+      services.push(svc);
+      added.push(svc.id);
+    } catch (err) {
+      errors.push({ providerServiceId: label, error: err.message });
+    }
+  }
+  if (added.length) writeServices(services);
+  res.status(added.length ? 201 : 200).json({ success: true, added: added.length, skipped: skipped.length, errors });
 });
 
 admin.put("/services/:id", (req, res) => {
@@ -614,7 +713,7 @@ app.get("/api", (req, res) => {
   res.json({
     ok: true,
     name: "AstroPulse API",
-    version: "bulk-delete-services",
+    version: "multi-provider-bulk-add",
     adminAuthConfigured: FIREBASE_READY || !!ADMIN_KEY
   });
 });
@@ -636,7 +735,7 @@ app.listen(PORT, () => {
   }
   const ep = envProvider();
   if (!ep) {
-    console.warn("⚠️   SMM API not configured. Add SMM_API_URL and SMM_API_KEY to .env");
+    console.log(`ℹ️   ${readStoredProviders().length} provider(s) added from the admin panel (max ${MAX_PROVIDERS}).`);
   } else {
     try { new URL(ep.url); console.log(`🔗  SMM API: ${ep.name} (${ep.url})`); }
     catch { console.warn("⚠️   SMM_API_URL in .env is not a valid URL"); }
