@@ -734,7 +734,8 @@ app.use("/api/admin", admin);
 //
 //   Key management (signed-in customer, Firebase Bearer token)
 //     GET    /api/user/api-key     -> { exists, hint, createdAt, lastUsedAt }   (key itself is never returned)
-//     POST   /api/user/api-key     -> creates / replaces the key; plaintext shown ONCE in this response
+//     POST   /api/user/api-key     -> creates the key (only if none exists); plaintext shown ONCE in this response.
+//                                     The key stays the same until the reseller revokes it.
 //     DELETE /api/user/api-key     -> revokes the key
 //
 //   Standard SMM panel API v2   POST /api/v2   (key, action = services | balance | add | status)
@@ -751,13 +752,15 @@ const PROXY_SECRET = String(process.env.PROXY_SECRET || "").trim();
 let fsdb = null, FV = null;
 function firestore() {
   if (fsdb) return fsdb;
-  let cred = null;
-  try {
-    const raw  = String(process.env.FIREBASE_SERVICE_ACCOUNT || "").trim();
-    const file = String(process.env.FIREBASE_SERVICE_ACCOUNT_FILE || "").trim();
-    cred = raw ? JSON.parse(raw) : (file ? JSON.parse(fs.readFileSync(path.resolve(__dirname, file), "utf8")) : null);
-  } catch { cred = null; }
-  if (!cred) throw new HttpError(503, "The reseller API is not configured on the server yet.");
+  let cred = null, why = "";
+  const raw  = String(process.env.FIREBASE_SERVICE_ACCOUNT || "").trim();
+  const file = String(process.env.FIREBASE_SERVICE_ACCOUNT_FILE || "").trim();
+  if (!raw && !file) why = "Neither FIREBASE_SERVICE_ACCOUNT_FILE nor FIREBASE_SERVICE_ACCOUNT is set in the server .env";
+  else {
+    try { cred = raw ? JSON.parse(raw) : JSON.parse(fs.readFileSync(path.resolve(__dirname, file), "utf8")); }
+    catch (e) { why = raw ? "FIREBASE_SERVICE_ACCOUNT is not valid JSON" : `Could not read the service-account file "${file}" (${e.code || e.message})`; }
+  }
+  if (!cred) { console.warn("[RESELLER] Not configured: " + why); throw new HttpError(503, "The reseller API is not configured on the server yet."); }
   let admin;
   try { admin = require("firebase-admin"); }
   catch { throw new HttpError(503, "The reseller API needs the firebase-admin package on the server."); }
@@ -831,7 +834,7 @@ userApi.post("/api-key", wrap(async (req, res) => {
   const userRef = db.collection("apiUsers").doc(req.user.uid);
   await db.runTransaction(async (t) => {
     const old = await t.get(userRef);
-    if (old.exists && old.data().keyHash) t.delete(db.collection("apiKeys").doc(old.data().keyHash));   // old key stops working
+    if (old.exists && old.data().keyHash) throw new HttpError(409, "You already have an API key. Revoke it first to create a new one.");
     t.set(db.collection("apiKeys").doc(hash), { uid: req.user.uid, createdAt: FV.serverTimestamp() });
     t.set(userRef, { keyHash: hash, last4: key.slice(-4), email: req.user.email, createdAt: FV.serverTimestamp(), lastUsedAt: null });
   });
@@ -981,6 +984,31 @@ async function apiOrderStatus(uid, orderId) {
   if (/complete/i.test(st)) remains = 0;
   return out(st, start, remains);
 }
+
+
+// ── Admin: see resellers and the orders that came in through the API ──
+const tsIso = (x) => (x && x.toDate ? x.toDate().toISOString() : null);
+admin.get("/resellers", wrap(async (req, res) => {
+  const db = firestore();
+  const [users, orders] = await Promise.all([db.collection("apiUsers").limit(500).get(), db.collection("orders").where("source", "==", "api").limit(2000).get()]);
+  const stat = {};
+  orders.forEach(d => { const o = d.data(); const s = stat[o.userId] || (stat[o.userId] = { orders: 0, spentPaise: 0 }); s.orders++; if (o.status !== "declined") s.spentPaise += (o.amountPaise || 0) - (o.refundPaise || 0); });
+  res.json(users.docs.map(d => { const u = d.data(); const s = stat[d.id] || { orders: 0, spentPaise: 0 };
+    return { uid: d.id, email: u.email || "", keyEnding: u.last4 || "", createdAt: tsIso(u.createdAt), lastUsedAt: tsIso(u.lastUsedAt), orders: s.orders, spent: rupees(s.spentPaise) }; }));
+}));
+admin.get("/reseller-orders", wrap(async (req, res) => {
+  const snap = await firestore().collection("orders").where("source", "==", "api").limit(1000).get();
+  const rows = snap.docs.map(d => { const o = d.data(); return { orderId: o.orderId, email: o.userEmail, service: o.service, serviceId: o.serviceId, quantity: o.quantity,
+    link: o.link, amount: rupees((o.amountPaise || 0) - (o.refundPaise || 0)), status: o.status, providerOrderId: o.providerOrderId || "", needsReview: !!o.needsReview, createdAt: tsIso(o.createdAt) }; });
+  rows.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  res.json(rows.slice(0, 300));
+}));
+admin.delete("/resellers/:uid", wrap(async (req, res) => {          // revoke a reseller's key
+  const db = firestore(); const ref = db.collection("apiUsers").doc(String(req.params.uid));
+  await db.runTransaction(async (t) => { const s = await t.get(ref); if (s.exists) { if (s.data().keyHash) t.delete(db.collection("apiKeys").doc(s.data().keyHash)); t.delete(ref); } });
+  console.log(`[RESELLER] key revoked for ${req.params.uid} by ${req.adminEmail || "admin key"}`);
+  res.json({ success: true });
+}));
 
 // ── POST /api/v2 — the endpoint other panels call ───────────
 const apiLastUsed = new Map();
@@ -1133,7 +1161,8 @@ app.get("/api", (req, res) => {
     ok: true,
     name: "AstroPulse API",
     version: "multi-provider-bulk-add+reseller-api",
-    adminAuthConfigured: FIREBASE_READY || !!ADMIN_KEY
+    adminAuthConfigured: FIREBASE_READY || !!ADMIN_KEY,
+    resellerApiConfigured: (() => { try { firestore(); return true; } catch { return false; } })()
   });
 });
 
