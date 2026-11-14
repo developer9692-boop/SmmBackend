@@ -59,10 +59,26 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ── Middleware ───────────────────────────────────────────────
 app.use(cors());
+app.disable("x-powered-by");
+if (process.env.TRUST_PROXY) app.set("trust proxy", Number(process.env.TRUST_PROXY) || 1);   // set TRUST_PROXY=1 only if behind Nginx/Cloudflare/host proxy (real IP for rate limits)
+// Security headers for every response (CSP limited to rules that cannot break the page)
+app.use((req, res, next) => {
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(self)",
+    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",      // keeps Google sign-in popup working
+    "Content-Security-Policy": "frame-ancestors 'self'; base-uri 'self'; object-src 'none'; form-action 'self'"
+  });
+  if (req.secure || req.get("x-forwarded-proto") === "https") res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false, limit: "200kb" }));   // SMM API v2 clients post form data
 
 // Never serve source, data or secret files (providers.json holds API keys)
-const BLOCKED = /^\/(data|node_modules|\.git)(\/|$)|^\/(server\.js|package(-lock)?\.json|orders\.json|fixed-services\.json|readme\.md|\.env[^/]*)$/i;
+const BLOCKED = /^\/(data|node_modules|\.git)(\/|$)|^\/(server\.js|package(-lock)?\.json|orders\.json|fixed-services\.json|readme\.md|\.env[^/]*)$|^\/[^/]*(service-?account|firebase-adminsdk)[^/]*\.json$/i;
 app.use((req, res, next) => {
   let p;
   try { p = decodeURIComponent(req.path).replace(/\\/g, "/"); }
@@ -714,6 +730,323 @@ admin.post("/provider-refill", wrap(async (req, res) => {
 app.use("/api/admin", admin);
 
 // ============================================================
+// RESELLER API — other SMM panels connect with a personal API key
+//
+//   Key management (signed-in customer, Firebase Bearer token)
+//     GET    /api/user/api-key     -> { exists, hint, createdAt, lastUsedAt }   (key itself is never returned)
+//     POST   /api/user/api-key     -> creates / replaces the key; plaintext shown ONCE in this response
+//     DELETE /api/user/api-key     -> revokes the key
+//
+//   Standard SMM panel API v2   POST /api/v2   (key, action = services | balance | add | status)
+//     add     : price is taken from the caller's wallet. Enough funds -> sent straight to the provider.
+//               Not enough funds, or provider rejects -> order FAILS and nothing is charged.
+//     status  : a key can only ever see its own orders.
+//
+//   Security: keys are random 192-bit values stored only as SHA-256 hashes; every wallet change is a
+//   Firestore transaction with a fixed ledger ID (no double charge / double refund); rate limits per
+//   IP and per key; the provider (name, URL, key, service IDs, errors) is never exposed to callers.
+//   Needs:  npm i firebase-admin   +   FIREBASE_SERVICE_ACCOUNT_FILE=./firebase-service-account.json  (.env)
+// ============================================================
+const PROXY_SECRET = String(process.env.PROXY_SECRET || "").trim();
+let fsdb = null, FV = null;
+function firestore() {
+  if (fsdb) return fsdb;
+  let cred = null;
+  try {
+    const raw  = String(process.env.FIREBASE_SERVICE_ACCOUNT || "").trim();
+    const file = String(process.env.FIREBASE_SERVICE_ACCOUNT_FILE || "").trim();
+    cred = raw ? JSON.parse(raw) : (file ? JSON.parse(fs.readFileSync(path.resolve(__dirname, file), "utf8")) : null);
+  } catch { cred = null; }
+  if (!cred) throw new HttpError(503, "The reseller API is not configured on the server yet.");
+  let admin;
+  try { admin = require("firebase-admin"); }
+  catch { throw new HttpError(503, "The reseller API needs the firebase-admin package on the server."); }
+  if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(cred) });
+  fsdb = admin.firestore(); FV = admin.firestore.FieldValue;
+  return fsdb;
+}
+
+// tiny in-memory rate limiter
+const buckets = new Map();
+function hit(name, limit, windowMs) {
+  const now = Date.now();
+  let b = buckets.get(name);
+  if (!b || b.reset < now) { b = { n: 0, reset: now + windowMs }; buckets.set(name, b); }
+  if (buckets.size > 5000) for (const [k, v] of buckets) if (v.reset < now) buckets.delete(k);
+  return ++b.n <= limit;
+}
+const noStore = (req, res, next) => { res.set("Cache-Control", "no-store"); next(); };
+const hashKey = (k) => crypto.createHash("sha256").update(String(k)).digest("hex");
+const rupees  = (paise) => (paise / 100).toFixed(2);
+function priceInPaise(qty, ratePer1k) {           // same rule as wallet.js
+  const ratePaise = Math.round(Number(ratePer1k) * 100);
+  if (!Number.isInteger(qty) || qty <= 0 || !(ratePaise > 0)) return NaN;
+  return Math.max(1, Math.round((qty * ratePaise) / 1000));
+}
+
+// ── Signed-in customer (Firebase ID token) ──────────────────
+const userTokenCache = new Map();
+async function verifyFirebaseUser(token) {
+  const hitC = userTokenCache.get(token);
+  if (hitC && hitC.exp > Date.now()) return hitC.user;
+  if (!FIREBASE_API_KEY) throw new HttpError(503, "FIREBASE_API_KEY is not set in the server .env file.");
+  let r;
+  try {
+    r = await fetch("https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=" + encodeURIComponent(FIREBASE_API_KEY),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ idToken: token }) });
+  } catch { throw new HttpError(502, "Could not verify your login. Try again."); }
+  if (!r.ok) return null;
+  const u = ((await r.json()).users || [])[0];
+  if (!u || !u.localId || u.disabled) return null;
+  const user = { uid: u.localId, email: String(u.email || ""), name: u.displayName || (u.email ? String(u.email).split("@")[0] : "User") };
+  if (userTokenCache.size > 500) userTokenCache.clear();
+  userTokenCache.set(token, { user, exp: Date.now() + 60 * 1000 });
+  return user;
+}
+async function requireUser(req, res, next) {
+  try {
+    const token = (req.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    const user = token ? await verifyFirebaseUser(token) : null;
+    if (!user) return res.status(401).json({ error: "Please sign in again." });
+    req.user = user; next();
+  } catch (err) { next(err); }
+}
+
+const userApi = express.Router();
+userApi.use(noStore, requireUser);
+
+userApi.get("/api-key", wrap(async (req, res) => {
+  const snap = await firestore().collection("apiUsers").doc(req.user.uid).get();
+  if (!snap.exists) return res.json({ exists: false });
+  const d = snap.data();
+  const ts = (t) => (t && t.toDate ? t.toDate().toISOString() : null);
+  res.json({ exists: true, hint: d.last4 || "", createdAt: ts(d.createdAt), lastUsedAt: ts(d.lastUsedAt) });
+}));
+
+userApi.post("/api-key", wrap(async (req, res) => {
+  if (!hit("keygen:" + req.user.uid, 5, 60 * 60 * 1000)) throw new HttpError(429, "Too many key changes. Try again in an hour.");
+  const db = firestore();
+  const key = "ap_" + crypto.randomBytes(24).toString("hex");
+  const hash = hashKey(key);
+  const userRef = db.collection("apiUsers").doc(req.user.uid);
+  await db.runTransaction(async (t) => {
+    const old = await t.get(userRef);
+    if (old.exists && old.data().keyHash) t.delete(db.collection("apiKeys").doc(old.data().keyHash));   // old key stops working
+    t.set(db.collection("apiKeys").doc(hash), { uid: req.user.uid, createdAt: FV.serverTimestamp() });
+    t.set(userRef, { keyHash: hash, last4: key.slice(-4), email: req.user.email, createdAt: FV.serverTimestamp(), lastUsedAt: null });
+  });
+  console.log(`[RESELLER] API key created for ${req.user.email}`);
+  res.status(201).json({ key, hint: key.slice(-4) });     // the ONLY time the plaintext key exists outside the customer's copy
+}));
+
+userApi.delete("/api-key", wrap(async (req, res) => {
+  const db = firestore();
+  const userRef = db.collection("apiUsers").doc(req.user.uid);
+  await db.runTransaction(async (t) => {
+    const s = await t.get(userRef);
+    if (s.exists) { if (s.data().keyHash) t.delete(db.collection("apiKeys").doc(s.data().keyHash)); t.delete(userRef); }
+  });
+  res.json({ success: true });
+}));
+app.use("/api/user", userApi);
+
+// ── Wallet helpers (same ledger shape as wallet.js) ─────────
+async function refundOrder(orderId, refundPaise, patch, note) {
+  const db = firestore();
+  const orderRef = db.collection("orders").doc(orderId);
+  const txRef = db.collection("walletTx").doc("R" + orderId);     // fixed ID: can only ever refund once
+  return db.runTransaction(async (t) => {
+    const os = await t.get(orderRef);
+    if (!os.exists) return false;
+    const o = os.data();
+    if (o.refunded) return false;
+    const userRef = db.collection("users").doc(o.userId);
+    const us = await t.get(userRef);
+    const bal = us.exists ? Number(us.data().balance) || 0 : 0;
+    const after = bal + refundPaise;
+    t.set(userRef, { balance: after, updatedAt: FV.serverTimestamp() }, { merge: true });
+    t.set(txRef, { userId: o.userId, userEmail: o.userEmail || "", type: "refund", amount: refundPaise, balanceAfter: after,
+      orderDocId: orderId, orderId, approvedBy: "system", note, createdAt: FV.serverTimestamp() });
+    t.update(orderRef, { ...patch, refunded: true, refundTx: txRef.id, refundPaise, updatedAt: FV.serverTimestamp() });
+    return true;
+  });
+}
+
+async function apiAddOrder(user, b) {
+  const service = readServices().find(s => String(s.id) === String(b.service) && s.active !== false);
+  if (!service) return { error: "Incorrect service ID" };
+  const link = String(b.link || "").trim();
+  if (!link || link.length > 500 || /[\u0000-\u001f]/.test(link)) return { error: "Incorrect link" };
+
+  const comments = typeof b.comments === "string" ? b.comments.replace(/\r/g, "").trim() : "";
+  const quantity = comments ? comments.split("\n").filter(l => l.trim()).length : Number(b.quantity);
+  if (!Number.isInteger(quantity) || quantity < service.min || quantity > service.max) {
+    return { error: `Quantity must be between ${service.min} and ${service.max}` };
+  }
+  if (comments.length > 20000) return { error: "Comments are too long" };
+  const provider = readProviders().find(p => p.id === service.providerId);
+  if (!provider || provider.active === false) return { error: "Service is temporarily unavailable" };
+  const amount = priceInPaise(quantity, service.rate);
+  if (!Number.isSafeInteger(amount)) return { error: "Could not price this order" };
+
+  const db = firestore();
+  const orderId = "ASTR" + crypto.randomInt(10000000, 100000000);
+  const userRef = db.collection("users").doc(user.uid);
+  const orderRef = db.collection("orders").doc(orderId);
+  const txRef = db.collection("walletTx").doc("D" + orderId);
+
+  try {
+    await db.runTransaction(async (t) => {
+      const [os, us] = await Promise.all([t.get(orderRef), t.get(userRef)]);
+      if (os.exists) throw new HttpError(409, "Please try again");
+      const bal = us.exists ? Number(us.data().balance) || 0 : 0;
+      if (bal < amount) throw Object.assign(new HttpError(402, "Not enough funds"), { funds: true });
+      const after = bal - amount;
+      t.update(userRef, { balance: after, lastTx: txRef.id, updatedAt: FV.serverTimestamp() });
+      t.set(txRef, { userId: user.uid, userEmail: user.email, type: "debit", amount, balanceAfter: after,
+        orderDocId: orderId, orderId, note: "API order " + orderId, createdAt: FV.serverTimestamp() });
+      t.set(orderRef, { orderId, userId: user.uid, userEmail: user.email, userName: user.name,
+        platform: service.platform ? service.platform[0].toUpperCase() + service.platform.slice(1) : "",
+        service: service.name, serviceId: service.id, refill: service.refill || "", quantity, link,
+        commentType: comments ? "Custom comments" : "", source: "api", status: "pending", paymentMethod: "wallet",
+        amountPaise: amount, amountPaid: "₹" + (amount / 100).toLocaleString("en-IN", { minimumFractionDigits: 2 }),
+        walletTx: txRef.id, createdAt: FV.serverTimestamp(), updatedAt: FV.serverTimestamp() });
+    });
+  } catch (err) {
+    if (err.funds) return { error: "Not enough funds. Add funds to your Astropulse wallet." };
+    throw err;
+  }
+
+  // Wallet charged → send straight to the provider
+  try {
+    const params = { action: "add", service: service.providerServiceId, link };
+    if (comments) params.comments = comments; else params.quantity = quantity;
+    const data = await providerCall(provider, params);
+    if (!data || data.order === undefined || data.order === null) throw new HttpError(502, "Provider did not return an order ID");
+    await orderRef.update({ providerOrderId: String(data.order), providerId: provider.id,
+      providerServiceId: service.providerServiceId, providerSentAt: FV.serverTimestamp() });
+    const sent = readSent();
+    sent.push({ reference: orderId, serviceId: service.id, providerId: provider.id, providerServiceId: service.providerServiceId,
+      providerOrderId: data.order, link, quantity, sentAt: new Date().toISOString(), source: "api" });
+    writeSent(sent);
+    console.log(`[RESELLER] ${orderId} ${user.email} → ${provider.name} #${data.order}`);
+    return { order: orderId };
+  } catch (err) {
+    console.error(`[RESELLER] ${orderId} provider error:`, err.message);
+    if (/timed out|invalid response/i.test(err.message)) {
+      // The provider may have accepted it: keep the charge, flag for the admin instead of risking a double spend
+      await orderRef.update({ needsReview: true, providerSync: "unknown", updatedAt: FV.serverTimestamp() });
+      return { order: orderId };
+    }
+    await refundOrder(orderId, amount, { status: "declined", failed: true, failReason: "provider" }, "Refund: order failed " + orderId);
+    return { error: "Order failed. You have not been charged." };
+  }
+}
+
+const statusCache = new Map();
+async function apiOrderStatus(uid, orderId) {
+  const id = String(orderId || "").trim();
+  if (!/^[A-Za-z0-9_-]{4,40}$/.test(id)) return { error: "Incorrect order ID" };
+  const ref = firestore().collection("orders").doc(id);
+  const snap = await ref.get();
+  if (!snap.exists || snap.data().userId !== uid) return { error: "Incorrect order ID" };   // never reveal other users' orders
+  let o = snap.data();
+  const out = (status, start, remains) => ({ charge: rupees(Math.max(0, (o.amountPaise || 0) - (o.refundPaise || 0))),
+    start_count: String(start || 0), status, remains: String(remains), currency: "INR" });
+
+  if (o.status === "declined") return out("Canceled", 0, o.quantity || 0);
+  if (!o.providerOrderId || !o.providerId) return out("Pending", 0, o.quantity || 0);
+
+  let d = statusCache.get(id);
+  if (!d || d.at < Date.now() - 15000) {
+    try { d = { at: Date.now(), data: await providerCall(findProvider(o.providerId), { action: "status", order: o.providerOrderId }) }; statusCache.set(id, d); }
+    catch { return out(o.status === "completed" ? "Completed" : "In progress", 0, o.status === "completed" ? 0 : o.quantity || 0); }
+    if (statusCache.size > 2000) statusCache.clear();
+  }
+  const st = String((d.data && d.data.status) || "Pending").slice(0, 30);
+  const start = Number(d.data && d.data.start_count) || 0;
+  let remains = Math.max(0, Math.min(o.quantity || 0, Math.round(Number(d.data && d.data.remains) || 0)));
+
+  if (/cancel/i.test(st) && !o.refunded) {
+    await refundOrder(id, o.amountPaise, { status: "declined", failReason: "canceled" }, "Refund: order canceled " + id);
+    o = { ...o, refundPaise: o.amountPaise, status: "declined" };
+  } else if (/partial/i.test(st) && !o.refunded) {
+    const back = o.quantity ? Math.floor(o.amountPaise * remains / o.quantity) : 0;
+    if (back > 0) await refundOrder(id, back, { status: "completed", partial: true }, "Partial refund " + id);
+    else await ref.update({ status: "completed", partial: true });
+    o = { ...o, refundPaise: back };
+  } else if (/complete/i.test(st) && o.status !== "completed") {
+    await ref.update({ status: "completed", updatedAt: FV.serverTimestamp() });
+  }
+  if (/complete/i.test(st)) remains = 0;
+  return out(st, start, remains);
+}
+
+// ── POST /api/v2 — the endpoint other panels call ───────────
+const apiLastUsed = new Map();
+app.all("/api/v2", noStore, async (req, res) => {
+  const send = (obj, status = 200) => res.status(status).json(obj);
+  try {
+    if (req.method === "GET") {
+      return send({ name: "Astropulse API", version: "v2", status: "online", method: "POST",
+        actions: ["services", "balance", "add", "status"],
+        usage: "Send key and action in the POST body. Create your key from Menu → API on the website." });
+    }
+    if (req.method !== "POST") return send({ error: "Send a POST request with key and action." });
+    // Real caller IP: trusted from the Vercel proxy only when it proves itself with PROXY_SECRET
+    const proxied = PROXY_SECRET && req.get("x-astro-proxy") && crypto.timingSafeEqual(sha(req.get("x-astro-proxy")), sha(PROXY_SECRET));
+    const ip = (proxied && String(req.get("x-astro-client-ip") || "").slice(0, 64)) || req.ip || "";
+    if (!hit("ip:" + ip, 120, 60 * 1000)) return send({ error: "Too many requests. Slow down." }, 429);
+    const b = req.body && typeof req.body === "object" ? req.body : {};
+    const key = String(b.key || "").trim();
+    if (!hit("bad:" + ip, 25, 10 * 60 * 1000)) return send({ error: "Too many invalid attempts. Try again later." }, 429);
+
+    const db = firestore();
+    const ks = /^ap_[0-9a-f]{48}$/.test(key) ? await db.collection("apiKeys").doc(hashKey(key)).get() : null;
+    if (!ks || !ks.exists) return send({ error: "Invalid API key" });
+    buckets.get("bad:" + ip).n--;                                   // only failed attempts count
+    const uid = ks.data().uid;
+    if (!hit("key:" + uid, 60, 60 * 1000)) return send({ error: "Rate limit reached (60 requests per minute)." }, 429);
+    if ((apiLastUsed.get(uid) || 0) < Date.now() - 60000) {
+      apiLastUsed.set(uid, Date.now());
+      db.collection("apiUsers").doc(uid).update({ lastUsedAt: FV.serverTimestamp() }).catch(() => {});
+    }
+
+    const action = String(b.action || "").toLowerCase();
+    if (action === "services") {
+      const providers = readProviders();
+      return send(readServices()
+        .filter(s => s.active !== false && providers.some(p => p.id === s.providerId && p.active !== false))
+        .map(s => ({ service: s.id, name: s.name, type: s.type || "Default",
+          category: s.platform ? s.platform[0].toUpperCase() + s.platform.slice(1) : "Other",
+          rate: Number(s.rate).toFixed(2), min: String(s.min), max: String(s.max), refill: false, cancel: false })));
+    }
+    const us = await db.collection("users").doc(uid).get();
+    const email = us.exists ? String(us.data().email || "") : "";
+    if (action === "balance") return send({ balance: rupees(us.exists ? Number(us.data().balance) || 0 : 0), currency: "INR" });
+    if (action === "add") {
+      if (!hit("add:" + uid, 30, 60 * 1000)) return send({ error: "Too many orders per minute." }, 429);
+      return send(await apiAddOrder({ uid, email, name: email ? email.split("@")[0] : "API user" }, b));
+    }
+    if (action === "status") {
+      if (b.orders !== undefined) {
+        const ids = String(b.orders).split(",").map(x => x.trim()).filter(Boolean).slice(0, 100);
+        if (!ids.length) return send({ error: "Incorrect order ID" });
+        const result = {};
+        for (const id of ids) result[id] = await apiOrderStatus(uid, id);
+        return send(result);
+      }
+      return send(await apiOrderStatus(uid, b.order));
+    }
+    return send({ error: "Incorrect action" });
+  } catch (err) {
+    if (err instanceof HttpError) return send({ error: err.message }, err.status === 429 ? 429 : 200);
+    console.error("[RESELLER] error:", err.message);
+    return send({ error: "Server error. Please try again." });
+  }
+});
+
+// ============================================================
 // LEGACY ORDERS API (file based)
 // ============================================================
 
@@ -799,7 +1132,7 @@ app.get("/api", (req, res) => {
   res.json({
     ok: true,
     name: "AstroPulse API",
-    version: "multi-provider-bulk-add",
+    version: "multi-provider-bulk-add+reseller-api",
     adminAuthConfigured: FIREBASE_READY || !!ADMIN_KEY
   });
 });
